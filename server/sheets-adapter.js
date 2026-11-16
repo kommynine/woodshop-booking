@@ -4,13 +4,20 @@
 var TABLES_ = {
   bookings: { sheet: "예약", cols: [
     ["id", "예약번호"], ["date", "날짜"], ["start", "시작"], ["end", "종료"], ["name", "이름"], ["last4", "휴대폰 뒷자리"],
-    ["project", "작업 내용"], ["stage", "작업 단계"], ["tools", "사용 장비"], ["status", "상태"], ["ownerNote", "원장 메모"], ["handledBy", "처리한 원장"], ["createdAt", "신청 시각"],
+    ["project", "작업 내용"], ["stage", "작업 단계"], ["tools", "사용 장비"], ["status", "상태"], ["ownerNote", "원장 메모"], ["handledBy", "처리한 원장"], ["createdAt", "신청 시각"], ["slackRef", "슬랙 메시지"],
   ] },
   members: { sheet: "회원", cols: [
     ["id", "회원번호"], ["name", "이름"], ["last4", "휴대폰 뒷자리"], ["phone", "연락처"], ["memo", "메모"], ["createdAt", "등록일"],
   ] },
+  fees: { sheet: "회비", cols: [
+    ["id", "기록번호"], ["memberId", "회원번호"], ["name", "이름"], ["last4", "휴대폰 뒷자리"],
+    ["start", "회비 시작일"], ["end", "회비 종료일"], ["note", "메모"], ["by", "기록한 원장"], ["createdAt", "기록 시각"],
+  ] },
 };
-var STATUS_LABEL_ = { booked: "예약됨", confirmed: "준비 확인", done: "작업 완료", cancelled: "취소" };
+var STATUS_LABEL_ = WoodshopCore.STATUS_LABELS; // 예약됨 / 작업 완료 / 취소
+// 이전 버전에서 쓰던 이름도 알아듣기
+var LEGACY_STATUS_ = { "준비 확인": "booked", "승인 대기": "booked", "승인됨": "booked", "거절": "cancelled",
+  confirmed: "booked", rejected: "cancelled" };
 var CONFIG_SHEET_ = "설정";
 var CONFIG_KEYS_ = [["capacity", "같은 시간 최대 인원"], ["open", "운영 시작"], ["close", "운영 종료"], ["tools", "장비 목록(쉼표로 구분)"]];
 
@@ -58,7 +65,9 @@ function toSheetVal_(table, key, v) {
 function fromSheetVal_(table, key, v) {
   if (table === "bookings" && key === "status") {
     for (var k in STATUS_LABEL_) if (STATUS_LABEL_[k] === v) return k;
-    return v || "booked";
+    if (LEGACY_STATUS_[v]) return LEGACY_STATUS_[v];
+    if (WoodshopCore.STATUS_LABELS[v]) return v; // 영어 코드로 적혀 있어도 인정
+    return "booked";
   }
   return v;
 }
@@ -140,6 +149,8 @@ function options_() {
   var now = new Date();
   return {
     admins: admins_(),
+    notify: slackNotify_,
+    log: function (m) { Logger.log(m); },
     today: Utilities.formatDate(now, "Asia/Seoul", "yyyy-MM-dd"),
     now: Utilities.formatDate(now, "Asia/Seoul", "yyyy-MM-dd HH:mm"),
   };
@@ -148,6 +159,8 @@ function options_() {
 function json_(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
 
 function doPost(e) {
+  // 이전 버전의 Slack 승인 버튼이 눌린 경우: 이제 승인 절차가 없으니 조용히 무시
+  if (e && e.parameter && e.parameter.payload) return HtmlService.createHtmlOutput("");
   var req = {};
   try { req = JSON.parse(e.postData.contents); } catch (err) { return json_({ ok: false, error: "요청 형식이 올바르지 않아요." }); }
   var lock = LockService.getScriptLock();
@@ -167,10 +180,14 @@ function doGet() {
 
 /** 처음 한 번 실행: 시트 탭(예약·회원·설정)을 만들고 권한을 승인받아요. */
 function setup() {
-  sheetFor_("bookings"); sheetFor_("members"); configSheet_();
+  sheetFor_("bookings"); sheetFor_("members"); sheetFor_("fees"); configSheet_();
   var a = admins_(), missing = ADMIN_USERS_.filter(function (u) { return !a[u[0]].pin; });
   Logger.log(missing.length
     ? "시트는 준비됐어요. 이제 '프로젝트 설정 > 스크립트 속성'에 다음 비밀번호를 추가해 주세요: " +
       missing.map(function (u) { return "PW_" + u[0] + " (" + u[1] + ")"; }).join(", ")
     : "준비 완료! 원장 " + ADMIN_USERS_.length + "명의 비밀번호가 모두 설정되어 있어요.");
+  var s = slackConf_();
+  Logger.log(s.token && s.channel
+    ? "Slack 연결 정보가 있어요. testSlack 을 실행해 시험 메시지를 보내 보세요."
+    : "Slack 은 아직 연결 전이에요. (SLACK_BOT_TOKEN, SLACK_CHANNEL_ID)");
 }

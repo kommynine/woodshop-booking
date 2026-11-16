@@ -1,7 +1,7 @@
 /**
  * 대전세종목공기술학원 예약 서버 (구글 Apps Script)
  * 이 파일 전체를 Apps Script 편집기의 Code.gs 에 붙여넣으세요.
- * 자동 생성 파일: core.js 와 server/sheets-adapter.js 를 고친 뒤 build.sh 로 다시 만드세요.
+ * 자동 생성 파일: core.js, server/sheets-adapter.js, server/slack.js 를 고친 뒤 build.sh 로 다시 만드세요.
  */
 /*
  * 대전세종목공기술학원 예약 앱 — 공통 처리 로직
@@ -11,7 +11,9 @@
  * db 는 rows/insert/update/remove/getConfig/setConfig 를 가진 저장소예요.
  */
 var WoodshopCore = (function () {
-  var STATUSES = ["booked", "confirmed", "done", "cancelled"];
+  // 예약은 신청 즉시 확정(booked). 원장이 필요하면 '작업 완료'나 '취소'로 바꿔요.
+  var STATUSES = ["booked", "done", "cancelled"];
+  var STATUS_LABELS = { booked: "예약됨", done: "작업 완료", cancelled: "취소" };
   var DEFAULT_CONFIG = {
     capacity: 6,
     open: "09:00",
@@ -39,6 +41,24 @@ var WoodshopCore = (function () {
     };
   }
   function active(b) { return b.status !== "cancelled"; }
+  // 서버가 정해 준 알림 함수(Slack 등)를 부르되, 알림이 실패해도 예약 처리는 그대로 진행
+  function notify(opt, event, b, db) {
+    if (!opt || typeof opt.notify !== "function") return;
+    try { opt.notify(event, b, db); } catch (e) { if (opt.log) opt.log("알림 실패: " + (e && e.message)); }
+  }
+  function findBooking(db, id) { return db.rows("bookings").filter(function (x) { return x.id === id; })[0]; }
+  /** 원장의 상태 변경 (작업 완료 / 취소 / 되돌리기) */
+  function decide(db, id, status, byName, opt) {
+    if (STATUSES.indexOf(status) < 0) fail("상태 값이 올바르지 않아요.");
+    var b = findBooking(db, str(id));
+    if (!b) fail("예약을 찾을 수 없어요.");
+    if (b.status === status) return { booking: b, changed: false };
+    var patch = { status: status, handledBy: byName || "" };
+    db.update("bookings", b.id, patch);
+    for (var k in patch) b[k] = patch[k];
+    notify(opt, "status", b, db);
+    return { booking: b, changed: true };
+  }
   function overlaps(a, s, e) { return toMin(a.start) < toMin(e) && toMin(s) < toMin(a.end); }
   function peak(list, s, e) {
     var max = 0;
@@ -98,6 +118,7 @@ var WoodshopCore = (function () {
       db.insert("bookings", b);
       if (!findMember(db, w.name, w.last4))
         db.insert("members", { id: newId(), name: w.name, last4: w.last4, phone: "", memo: "", createdAt: now });
+      notify(opt, "new", b, db);
       return pub(b);
     },
 
@@ -113,8 +134,10 @@ var WoodshopCore = (function () {
       var b = db.rows("bookings").filter(function (x) { return x.id === str(p.id); })[0];
       if (!b || b.name !== w.name || b.last4 !== w.last4) fail("예약을 찾을 수 없어요.");
       if (b.date < opt.today) fail("지난 예약은 취소할 수 없어요.");
-      if (b.status === "done" || b.status === "cancelled") fail("이미 " + (b.status === "done" ? "완료된" : "취소된") + " 예약이에요.");
+      if (b.status !== "booked") fail("이미 '" + STATUS_LABELS[b.status] + "' 상태라 취소할 수 없어요.");
       db.update("bookings", b.id, { status: "cancelled" });
+      b.status = "cancelled";
+      notify(opt, "cancelled", b, db);
       return { ok: true };
     },
   };
@@ -122,12 +145,9 @@ var WoodshopCore = (function () {
   var adminActions = {
     adminCheck: function () { return { ok: true }; },
     adminData: function (p, db) {
-      return { bookings: db.rows("bookings").map(full), members: db.rows("members"), config: config(db) };
+      return { bookings: db.rows("bookings").map(full), members: db.rows("members"), fees: db.rows("fees"), config: config(db) };
     },
-    setStatus: function (p, db, opt) {
-      if (STATUSES.indexOf(p.status) < 0) fail("상태 값이 올바르지 않아요.");
-      db.update("bookings", str(p.id), { status: p.status, handledBy: opt.adminName }); return { ok: true };
-    },
+    setStatus: function (p, db, opt) { decide(db, p.id, p.status, opt.adminName, opt); return { ok: true }; },
     setNote: function (p, db, opt) { db.update("bookings", str(p.id), { ownerNote: str(p.note, 300), handledBy: opt.adminName }); return { ok: true }; },
     deleteBooking: function (p, db) { db.remove("bookings", str(p.id)); return { ok: true }; },
     saveMember: function (p, db, opt) {
@@ -137,12 +157,25 @@ var WoodshopCore = (function () {
       if (p.id) {
         if (dup && dup.id !== p.id) fail("같은 이름·뒷자리 회원이 이미 있어요.");
         db.update("members", str(p.id), v);
-        return { ok: true };
+        return { id: str(p.id) };
       }
       if (dup) fail("같은 이름·뒷자리 회원이 이미 있어요.");
       v.id = newId(); v.createdAt = opt.now; db.insert("members", v);
-      return { ok: true };
+      return { id: v.id };
     },
+    // 회비 납부 기간 (한 회원에 여러 번 쌓여요)
+    saveFee: function (p, db, opt) {
+      var m = db.rows("members").filter(function (x) { return x.id === str(p.memberId); })[0];
+      if (!m) fail("회원을 찾을 수 없어요.");
+      var s = str(p.start), e = str(p.end);
+      if (!isDate(s) || !isDate(e)) fail("회비기간 시작일과 종료일을 골라 주세요.");
+      if (e < s) fail("종료일이 시작일보다 빨라요.");
+      var v = { memberId: m.id, name: m.name, last4: m.last4, start: s, end: e, note: str(p.note, 100), by: opt.adminName || "" };
+      if (p.id) { db.update("fees", str(p.id), v); return { id: str(p.id) }; }
+      v.id = newId(); v.createdAt = opt.now; db.insert("fees", v);
+      return { id: v.id };
+    },
+    deleteFee: function (p, db) { db.remove("fees", str(p.id)); return { ok: true }; },
     deleteMember: function (p, db) { db.remove("members", str(p.id)); return { ok: true }; },
     saveConfig: function (p, db) {
       var cap = Math.max(1, Math.min(50, Number(p.capacity) || DEFAULT_CONFIG.capacity));
@@ -179,7 +212,7 @@ var WoodshopCore = (function () {
     }
   }
 
-  return { handle: handle, DEFAULT_CONFIG: DEFAULT_CONFIG };
+  return { handle: handle, decide: decide, DEFAULT_CONFIG: DEFAULT_CONFIG, STATUS_LABELS: STATUS_LABELS };
 })();
 
 /* ───────────── 아래부터는 구글 시트 연결 부분 ───────────── */
@@ -188,13 +221,20 @@ var WoodshopCore = (function () {
 var TABLES_ = {
   bookings: { sheet: "예약", cols: [
     ["id", "예약번호"], ["date", "날짜"], ["start", "시작"], ["end", "종료"], ["name", "이름"], ["last4", "휴대폰 뒷자리"],
-    ["project", "작업 내용"], ["stage", "작업 단계"], ["tools", "사용 장비"], ["status", "상태"], ["ownerNote", "원장 메모"], ["handledBy", "처리한 원장"], ["createdAt", "신청 시각"],
+    ["project", "작업 내용"], ["stage", "작업 단계"], ["tools", "사용 장비"], ["status", "상태"], ["ownerNote", "원장 메모"], ["handledBy", "처리한 원장"], ["createdAt", "신청 시각"], ["slackRef", "슬랙 메시지"],
   ] },
   members: { sheet: "회원", cols: [
     ["id", "회원번호"], ["name", "이름"], ["last4", "휴대폰 뒷자리"], ["phone", "연락처"], ["memo", "메모"], ["createdAt", "등록일"],
   ] },
+  fees: { sheet: "회비", cols: [
+    ["id", "기록번호"], ["memberId", "회원번호"], ["name", "이름"], ["last4", "휴대폰 뒷자리"],
+    ["start", "회비 시작일"], ["end", "회비 종료일"], ["note", "메모"], ["by", "기록한 원장"], ["createdAt", "기록 시각"],
+  ] },
 };
-var STATUS_LABEL_ = { booked: "예약됨", confirmed: "준비 확인", done: "작업 완료", cancelled: "취소" };
+var STATUS_LABEL_ = WoodshopCore.STATUS_LABELS; // 예약됨 / 작업 완료 / 취소
+// 이전 버전에서 쓰던 이름도 알아듣기
+var LEGACY_STATUS_ = { "준비 확인": "booked", "승인 대기": "booked", "승인됨": "booked", "거절": "cancelled",
+  confirmed: "booked", rejected: "cancelled" };
 var CONFIG_SHEET_ = "설정";
 var CONFIG_KEYS_ = [["capacity", "같은 시간 최대 인원"], ["open", "운영 시작"], ["close", "운영 종료"], ["tools", "장비 목록(쉼표로 구분)"]];
 
@@ -242,7 +282,9 @@ function toSheetVal_(table, key, v) {
 function fromSheetVal_(table, key, v) {
   if (table === "bookings" && key === "status") {
     for (var k in STATUS_LABEL_) if (STATUS_LABEL_[k] === v) return k;
-    return v || "booked";
+    if (LEGACY_STATUS_[v]) return LEGACY_STATUS_[v];
+    if (WoodshopCore.STATUS_LABELS[v]) return v; // 영어 코드로 적혀 있어도 인정
+    return "booked";
   }
   return v;
 }
@@ -324,6 +366,8 @@ function options_() {
   var now = new Date();
   return {
     admins: admins_(),
+    notify: slackNotify_,
+    log: function (m) { Logger.log(m); },
     today: Utilities.formatDate(now, "Asia/Seoul", "yyyy-MM-dd"),
     now: Utilities.formatDate(now, "Asia/Seoul", "yyyy-MM-dd HH:mm"),
   };
@@ -332,6 +376,8 @@ function options_() {
 function json_(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
 
 function doPost(e) {
+  // 이전 버전의 Slack 승인 버튼이 눌린 경우: 이제 승인 절차가 없으니 조용히 무시
+  if (e && e.parameter && e.parameter.payload) return HtmlService.createHtmlOutput("");
   var req = {};
   try { req = JSON.parse(e.postData.contents); } catch (err) { return json_({ ok: false, error: "요청 형식이 올바르지 않아요." }); }
   var lock = LockService.getScriptLock();
@@ -351,10 +397,97 @@ function doGet() {
 
 /** 처음 한 번 실행: 시트 탭(예약·회원·설정)을 만들고 권한을 승인받아요. */
 function setup() {
-  sheetFor_("bookings"); sheetFor_("members"); configSheet_();
+  sheetFor_("bookings"); sheetFor_("members"); sheetFor_("fees"); configSheet_();
   var a = admins_(), missing = ADMIN_USERS_.filter(function (u) { return !a[u[0]].pin; });
   Logger.log(missing.length
     ? "시트는 준비됐어요. 이제 '프로젝트 설정 > 스크립트 속성'에 다음 비밀번호를 추가해 주세요: " +
       missing.map(function (u) { return "PW_" + u[0] + " (" + u[1] + ")"; }).join(", ")
     : "준비 완료! 원장 " + ADMIN_USERS_.length + "명의 비밀번호가 모두 설정되어 있어요.");
+  var s = slackConf_();
+  Logger.log(s.token && s.channel
+    ? "Slack 연결 정보가 있어요. testSlack 을 실행해 시험 메시지를 보내 보세요."
+    : "Slack 은 아직 연결 전이에요. (SLACK_BOT_TOKEN, SLACK_CHANNEL_ID)");
+}
+
+/* ───────────── Slack 알림 (알림만, 승인 절차 없음) ─────────────
+ * 스크립트 속성(프로젝트 설정 > 스크립트 속성)에 아래 두 값을 넣으면 켜져요. 비어 있으면 Slack 없이 그대로 동작해요.
+ *   SLACK_BOT_TOKEN   xoxb- 로 시작하는 봇 토큰
+ *   SLACK_CHANNEL_ID  알림을 받을 채널 ID (C 로 시작)
+ * 새 예약이 들어오면 채널에 알림이 가고, 회원이 취소하면 그 알림 아래에 취소 소식이 붙어요.
+ */
+var SITE_URL_ = "https://kommynine.github.io/woodshop-booking/";
+var DAYS_KO_ = ["일", "월", "화", "수", "목", "금", "토"];
+
+function slackConf_() {
+  var p = PropertiesService.getScriptProperties();
+  return { token: p.getProperty("SLACK_BOT_TOKEN"), channel: p.getProperty("SLACK_CHANNEL_ID") };
+}
+
+function slackApi_(method, body) {
+  var c = slackConf_();
+  var res = UrlFetchApp.fetch("https://slack.com/api/" + method, {
+    method: "post", contentType: "application/json; charset=utf-8",
+    headers: { Authorization: "Bearer " + c.token },
+    payload: JSON.stringify(body), muteHttpExceptions: true,
+  });
+  var j = JSON.parse(res.getContentText() || "{}");
+  if (!j.ok) throw new Error("Slack " + method + " 실패: " + j.error);
+  return j;
+}
+
+function prettyDate_(d) {
+  var p = String(d).split("-").map(Number), dt = new Date(p[0], p[1] - 1, p[2]);
+  return p[1] + "/" + p[2] + "(" + DAYS_KO_[dt.getDay()] + ")";
+}
+function esc_(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+
+/** 예약 하나를 Slack 메시지 모양으로 */
+function slackBlocks_(b) {
+  var L = WoodshopCore.STATUS_LABELS;
+  var head = { booked: "🪚 새 방문 예약", done: "🏁 작업 완료", cancelled: "🚫 취소된 예약" }[b.status] || "🪚 방문 예약";
+  var lines = [
+    "*" + head + "*",
+    "*" + esc_(b.name) + "* (휴대폰 뒷자리 " + esc_(b.last4) + ")",
+    "📅 " + prettyDate_(b.date) + "  " + b.start + "~" + b.end,
+    "🔨 " + esc_(b.project) + (b.stage ? "  ·  " + esc_(b.stage) : ""),
+  ];
+  if (b.tools) lines.push("🧰 " + esc_(b.tools));
+  if (b.ownerNote) lines.push("📝 " + esc_(b.ownerNote));
+  var by = b.status === "cancelled" && !b.handledBy ? "회원 본인" : (b.handledBy ? b.handledBy + " 원장" : "");
+  var blocks = [
+    { type: "section", text: { type: "mrkdwn", text: lines.join("\n") } },
+    { type: "context", elements: [{ type: "mrkdwn",
+      text: "상태: *" + (L[b.status] || b.status) + "*" + (b.status !== "booked" && by ? "  ·  " + esc_(by) : "") +
+        "  ·  신청 " + esc_(b.createdAt) + "  ·  <" + SITE_URL_ + "|예약 화면 열기>" }] },
+  ];
+  return { blocks: blocks, text: head + " - " + b.name + " " + prettyDate_(b.date) + " " + b.start + "~" + b.end + " " + b.project };
+}
+
+/** core.js 가 예약이 생기거나 바뀔 때 불러요. */
+function slackNotify_(event, b, db) {
+  var c = slackConf_();
+  if (!c.token || !c.channel) return; // Slack 설정 전이면 조용히 넘어감
+  var msg = slackBlocks_(b);
+  var ref = String(b.slackRef || "").split("|"); // "채널|ts"
+  if (ref.length === 2 && ref[1]) {
+    slackApi_("chat.update", { channel: ref[0], ts: ref[1], blocks: msg.blocks, text: msg.text });
+    if (event === "cancelled") // 회원 취소는 원장님이 알아차리도록 새 알림으로도
+      slackApi_("chat.postMessage", { channel: ref[0], thread_ts: ref[1], reply_broadcast: true,
+        text: "🚫 " + b.name + " 님이 " + prettyDate_(b.date) + " " + b.start + "~" + b.end + " 예약을 취소했어요." });
+    return;
+  }
+  if (event !== "new") return; // Slack 연결 전에 들어온 예약은 새로 올리지 않음
+  var j = slackApi_("chat.postMessage", { channel: c.channel, blocks: msg.blocks, text: msg.text });
+  db.update("bookings", b.id, { slackRef: j.channel + "|" + j.ts });
+}
+
+/** Apps Script 편집기에서 실행: Slack 연결이 되는지 시험 메시지를 보내요. */
+function testSlack() {
+  var c = slackConf_(), miss = [];
+  if (!c.token) miss.push("SLACK_BOT_TOKEN");
+  if (!c.channel) miss.push("SLACK_CHANNEL_ID");
+  if (miss.length) { Logger.log("스크립트 속성이 비어 있어요: " + miss.join(", ")); return; }
+  slackApi_("chat.postMessage", { channel: c.channel,
+    text: "🪚 대전세종목공기술학원 예약 알림이 연결됐어요! 이제 새 방문 예약이 들어오면 이 채널로 알려 드릴게요." });
+  Logger.log("시험 메시지를 보냈어요. Slack 채널을 확인해 주세요.");
 }
