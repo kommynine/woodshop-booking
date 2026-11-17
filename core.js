@@ -41,6 +41,26 @@ var WoodshopCore = (function () {
     if (!opt || typeof opt.notify !== "function") return;
     try { opt.notify(event, b, db); } catch (e) { if (opt.log) opt.log("알림 실패: " + (e && e.message)); }
   }
+  /* ── 변경 기록(감사 로그): 데이터가 바뀔 때마다 '누가 · 무엇을 · 전→후'를 서버에 알려요.
+   *    서버(Slack 연결부)가 받아서 고명균 원장님께 개인 메시지로 보내요. 실패해도 처리에는 영향 없음. */
+  var WD = ["일", "월", "화", "수", "목", "금", "토"];
+  function md(d) { var p = String(d).split("-").map(Number); return p[1] + "/" + p[2] + "(" + WD[new Date(p[0], p[1] - 1, p[2]).getDay()] + ")"; }
+  function bLine(b) { return b.name + "(" + b.last4 + ") · " + md(b.date) + " " + b.start + "~" + b.end + " · " + b.project; }
+  function show(v) { v = v == null ? "" : String(v); return v ? "\"" + v + "\"" : "(비어 있음)"; }
+  function diff(before, after, fields) {
+    var out = [];
+    fields.forEach(function (f) {
+      var a = before[f[0]] == null ? "" : String(before[f[0]]), b = after[f[0]] == null ? "" : String(after[f[0]]);
+      if (a !== b) out.push(f[1] + ": " + show(a) + " → " + show(b));
+    });
+    return out;
+  }
+  function audit(opt, title, lines) {
+    if (!opt || typeof opt.audit !== "function") return;
+    try {
+      opt.audit({ title: title, lines: lines || [], actor: opt.actor || "알 수 없음", actorAdminId: opt.adminId || "", at: opt.now || "" });
+    } catch (e) { if (opt.log) opt.log("변경 알림 실패: " + (e && e.message)); }
+  }
   function findBooking(db, id) { return db.rows("bookings").filter(function (x) { return x.id === id; })[0]; }
   /** 원장의 상태 변경 (작업 완료 / 취소 / 되돌리기) */
   function decide(db, id, status, byName, opt) {
@@ -48,10 +68,12 @@ var WoodshopCore = (function () {
     var b = findBooking(db, str(id));
     if (!b) fail("예약을 찾을 수 없어요.");
     if (b.status === status) return { booking: b, changed: false };
+    var before = b.status;
     var patch = { status: status, handledBy: byName || "" };
     db.update("bookings", b.id, patch);
     for (var k in patch) b[k] = patch[k];
     notify(opt, "status", b, db);
+    audit(opt, "🔄 예약 상태 변경", [bLine(b), "상태: " + STATUS_LABELS[before] + " → " + STATUS_LABELS[status]]);
     return { booking: b, changed: true };
   }
   function overlaps(a, s, e) { return toMin(a.start) < toMin(e) && toMin(s) < toMin(a.end); }
@@ -111,9 +133,16 @@ var WoodshopCore = (function () {
       var b = { id: newId(), name: w.name, last4: w.last4, date: date, start: s, end: e, project: project,
         stage: stage, tools: tools.join(", "), status: "booked", ownerNote: "", createdAt: now };
       db.insert("bookings", b);
-      if (!findMember(db, w.name, w.last4))
+      var newMember = !findMember(db, w.name, w.last4);
+      if (newMember)
         db.insert("members", { id: newId(), name: w.name, last4: w.last4, phone: "", memo: "", createdAt: now });
       notify(opt, "new", b, db);
+      opt.actor = "회원 본인 (" + w.name + "·" + w.last4 + ")";
+      var bl = [bLine(b)];
+      if (stage) bl.push("작업 단계: " + stage);
+      if (tools.length) bl.push("사용 장비: " + tools.join(", "));
+      if (newMember) bl.push("➕ 처음 예약한 회원이라 회원 목록에 자동 등록했어요.");
+      audit(opt, "🆕 새 예약", bl);
       return pub(b);
     },
 
@@ -133,6 +162,8 @@ var WoodshopCore = (function () {
       db.update("bookings", b.id, { status: "cancelled" });
       b.status = "cancelled";
       notify(opt, "cancelled", b, db);
+      opt.actor = "회원 본인 (" + w.name + "·" + w.last4 + ")";
+      audit(opt, "🚫 회원이 예약 취소", [bLine(b)]);
       return { ok: true };
     },
   };
@@ -143,19 +174,40 @@ var WoodshopCore = (function () {
       return { bookings: db.rows("bookings").map(full), members: db.rows("members"), fees: db.rows("fees"), config: config(db) };
     },
     setStatus: function (p, db, opt) { decide(db, p.id, p.status, opt.adminName, opt); return { ok: true }; },
-    setNote: function (p, db, opt) { db.update("bookings", str(p.id), { ownerNote: str(p.note, 300), handledBy: opt.adminName }); return { ok: true }; },
-    deleteBooking: function (p, db) { db.remove("bookings", str(p.id)); return { ok: true }; },
+    setNote: function (p, db, opt) {
+      var b = findBooking(db, str(p.id));
+      if (!b) fail("예약을 찾을 수 없어요.");
+      var note = str(p.note, 300);
+      if (note === (b.ownerNote || "")) return { ok: true };
+      db.update("bookings", b.id, { ownerNote: note, handledBy: opt.adminName });
+      audit(opt, "📝 예약 메모 수정", [bLine(b), "메모: " + show(b.ownerNote) + " → " + show(note)]);
+      return { ok: true };
+    },
+    deleteBooking: function (p, db, opt) {
+      var b = findBooking(db, str(p.id));
+      if (!b) return { ok: true };
+      db.remove("bookings", b.id);
+      audit(opt, "🗑️ 예약 삭제", [bLine(b), "삭제 전 상태: " + (STATUS_LABELS[b.status] || b.status)]);
+      return { ok: true };
+    },
     saveMember: function (p, db, opt) {
       var w = who(p);
       var v = { name: w.name, last4: w.last4, phone: str(p.phone, 20), memo: str(p.memo, 300) };
       var dup = findMember(db, w.name, w.last4);
       if (p.id) {
         if (dup && dup.id !== p.id) fail("같은 이름·뒷자리 회원이 이미 있어요.");
+        var old = db.rows("members").filter(function (x) { return x.id === str(p.id); })[0] || {};
         db.update("members", str(p.id), v);
+        var ch = diff(old, v, [["name", "이름"], ["last4", "휴대폰 뒷자리"], ["phone", "연락처"], ["memo", "기타(메모)"]]);
+        if (ch.length) audit(opt, "✏️ 회원 정보 수정", [(old.name || v.name) + "(" + (old.last4 || v.last4) + ")"].concat(ch));
         return { id: str(p.id) };
       }
       if (dup) fail("같은 이름·뒷자리 회원이 이미 있어요.");
       v.id = newId(); v.createdAt = opt.now; db.insert("members", v);
+      var ml = [v.name + "(" + v.last4 + ")"];
+      if (v.phone) ml.push("연락처: " + v.phone);
+      if (v.memo) ml.push("기타(메모): " + v.memo);
+      audit(opt, "👤 회원 추가", ml);
       return { id: v.id };
     },
     // 회비 납부 기간 (한 회원에 여러 번 쌓여요)
@@ -166,19 +218,44 @@ var WoodshopCore = (function () {
       if (!isDate(s) || !isDate(e)) fail("회비기간 시작일과 종료일을 골라 주세요.");
       if (e < s) fail("종료일이 시작일보다 빨라요.");
       var v = { memberId: m.id, name: m.name, last4: m.last4, start: s, end: e, note: str(p.note, 100), by: opt.adminName || "" };
-      if (p.id) { db.update("fees", str(p.id), v); return { id: str(p.id) }; }
+      if (p.id) {
+        var oldF = db.rows("fees").filter(function (x) { return x.id === str(p.id); })[0] || {};
+        db.update("fees", str(p.id), v);
+        var fc = diff(oldF, v, [["start", "시작일"], ["end", "종료일"], ["note", "메모"]]);
+        if (fc.length) audit(opt, "💳 회비기간 수정", [m.name + "(" + m.last4 + ")"].concat(fc));
+        return { id: str(p.id) };
+      }
       v.id = newId(); v.createdAt = opt.now; db.insert("fees", v);
+      audit(opt, "💳 회비기간 추가", [m.name + "(" + m.last4 + ")", "기간: " + s + " ~ " + e + (v.note ? " · " + v.note : "")]);
       return { id: v.id };
     },
-    deleteFee: function (p, db) { db.remove("fees", str(p.id)); return { ok: true }; },
-    deleteMember: function (p, db) { db.remove("members", str(p.id)); return { ok: true }; },
-    saveConfig: function (p, db) {
+    deleteFee: function (p, db, opt) {
+      var f = db.rows("fees").filter(function (x) { return x.id === str(p.id); })[0];
+      if (!f) return { ok: true };
+      db.remove("fees", f.id);
+      audit(opt, "🗑️ 회비기간 삭제", [f.name + "(" + f.last4 + ")", "기간: " + f.start + " ~ " + f.end + (f.note ? " · " + f.note : "")]);
+      return { ok: true };
+    },
+    deleteMember: function (p, db, opt) {
+      var m = db.rows("members").filter(function (x) { return x.id === str(p.id); })[0];
+      if (!m) return { ok: true };
+      db.remove("members", m.id);
+      audit(opt, "🗑️ 회원 삭제", [m.name + "(" + m.last4 + ")" + (m.memo ? " · 메모: " + m.memo : ""), "예약·회비 기록은 시트에 남아 있어요."]);
+      return { ok: true };
+    },
+    saveConfig: function (p, db, opt) {
+      var before = config(db);
       var cap = Math.max(1, Math.min(50, Number(p.capacity) || DEFAULT_CONFIG.capacity));
       var tools = (Array.isArray(p.tools) ? p.tools : splitTools(p.tools)).map(function (t) { return str(t, 30); }).filter(Boolean);
       var open = isTime(p.open) ? p.open : DEFAULT_CONFIG.open, close = isTime(p.close) ? p.close : DEFAULT_CONFIG.close;
       if (toMin(close) <= toMin(open)) fail("마감 시간이 시작 시간보다 늦어야 해요.");
       db.setConfig({ capacity: cap, tools: tools.join(", "), open: open, close: close });
-      return config(db);
+      var after = config(db);
+      var cc = diff({ capacity: before.capacity, hours: before.open + "~" + before.close, tools: before.tools.join(", ") },
+        { capacity: after.capacity, hours: after.open + "~" + after.close, tools: after.tools.join(", ") },
+        [["capacity", "같은 시간 최대 인원"], ["hours", "운영 시간"], ["tools", "장비 목록"]]);
+      if (cc.length) audit(opt, "⚙️ 공방 설정 변경", cc);
+      return after;
     },
   };
 
@@ -199,6 +276,8 @@ var WoodshopCore = (function () {
           return { ok: false, error: "아이디 또는 비밀번호가 맞지 않아요.", badPin: true };
         if (a === "adminCheck") return { ok: true, data: { id: str(req.adminId), name: admin.name } };
         opt.adminName = admin.name;
+        opt.adminId = str(req.adminId);
+        opt.actor = admin.name + " 원장";
         return { ok: true, data: adminActions[a](req, db, opt) };
       }
       return { ok: false, error: "알 수 없는 요청이에요." };

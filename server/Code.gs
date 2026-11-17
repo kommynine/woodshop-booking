@@ -46,6 +46,26 @@ var WoodshopCore = (function () {
     if (!opt || typeof opt.notify !== "function") return;
     try { opt.notify(event, b, db); } catch (e) { if (opt.log) opt.log("알림 실패: " + (e && e.message)); }
   }
+  /* ── 변경 기록(감사 로그): 데이터가 바뀔 때마다 '누가 · 무엇을 · 전→후'를 서버에 알려요.
+   *    서버(Slack 연결부)가 받아서 고명균 원장님께 개인 메시지로 보내요. 실패해도 처리에는 영향 없음. */
+  var WD = ["일", "월", "화", "수", "목", "금", "토"];
+  function md(d) { var p = String(d).split("-").map(Number); return p[1] + "/" + p[2] + "(" + WD[new Date(p[0], p[1] - 1, p[2]).getDay()] + ")"; }
+  function bLine(b) { return b.name + "(" + b.last4 + ") · " + md(b.date) + " " + b.start + "~" + b.end + " · " + b.project; }
+  function show(v) { v = v == null ? "" : String(v); return v ? "\"" + v + "\"" : "(비어 있음)"; }
+  function diff(before, after, fields) {
+    var out = [];
+    fields.forEach(function (f) {
+      var a = before[f[0]] == null ? "" : String(before[f[0]]), b = after[f[0]] == null ? "" : String(after[f[0]]);
+      if (a !== b) out.push(f[1] + ": " + show(a) + " → " + show(b));
+    });
+    return out;
+  }
+  function audit(opt, title, lines) {
+    if (!opt || typeof opt.audit !== "function") return;
+    try {
+      opt.audit({ title: title, lines: lines || [], actor: opt.actor || "알 수 없음", actorAdminId: opt.adminId || "", at: opt.now || "" });
+    } catch (e) { if (opt.log) opt.log("변경 알림 실패: " + (e && e.message)); }
+  }
   function findBooking(db, id) { return db.rows("bookings").filter(function (x) { return x.id === id; })[0]; }
   /** 원장의 상태 변경 (작업 완료 / 취소 / 되돌리기) */
   function decide(db, id, status, byName, opt) {
@@ -53,10 +73,12 @@ var WoodshopCore = (function () {
     var b = findBooking(db, str(id));
     if (!b) fail("예약을 찾을 수 없어요.");
     if (b.status === status) return { booking: b, changed: false };
+    var before = b.status;
     var patch = { status: status, handledBy: byName || "" };
     db.update("bookings", b.id, patch);
     for (var k in patch) b[k] = patch[k];
     notify(opt, "status", b, db);
+    audit(opt, "🔄 예약 상태 변경", [bLine(b), "상태: " + STATUS_LABELS[before] + " → " + STATUS_LABELS[status]]);
     return { booking: b, changed: true };
   }
   function overlaps(a, s, e) { return toMin(a.start) < toMin(e) && toMin(s) < toMin(a.end); }
@@ -116,9 +138,16 @@ var WoodshopCore = (function () {
       var b = { id: newId(), name: w.name, last4: w.last4, date: date, start: s, end: e, project: project,
         stage: stage, tools: tools.join(", "), status: "booked", ownerNote: "", createdAt: now };
       db.insert("bookings", b);
-      if (!findMember(db, w.name, w.last4))
+      var newMember = !findMember(db, w.name, w.last4);
+      if (newMember)
         db.insert("members", { id: newId(), name: w.name, last4: w.last4, phone: "", memo: "", createdAt: now });
       notify(opt, "new", b, db);
+      opt.actor = "회원 본인 (" + w.name + "·" + w.last4 + ")";
+      var bl = [bLine(b)];
+      if (stage) bl.push("작업 단계: " + stage);
+      if (tools.length) bl.push("사용 장비: " + tools.join(", "));
+      if (newMember) bl.push("➕ 처음 예약한 회원이라 회원 목록에 자동 등록했어요.");
+      audit(opt, "🆕 새 예약", bl);
       return pub(b);
     },
 
@@ -138,6 +167,8 @@ var WoodshopCore = (function () {
       db.update("bookings", b.id, { status: "cancelled" });
       b.status = "cancelled";
       notify(opt, "cancelled", b, db);
+      opt.actor = "회원 본인 (" + w.name + "·" + w.last4 + ")";
+      audit(opt, "🚫 회원이 예약 취소", [bLine(b)]);
       return { ok: true };
     },
   };
@@ -148,19 +179,40 @@ var WoodshopCore = (function () {
       return { bookings: db.rows("bookings").map(full), members: db.rows("members"), fees: db.rows("fees"), config: config(db) };
     },
     setStatus: function (p, db, opt) { decide(db, p.id, p.status, opt.adminName, opt); return { ok: true }; },
-    setNote: function (p, db, opt) { db.update("bookings", str(p.id), { ownerNote: str(p.note, 300), handledBy: opt.adminName }); return { ok: true }; },
-    deleteBooking: function (p, db) { db.remove("bookings", str(p.id)); return { ok: true }; },
+    setNote: function (p, db, opt) {
+      var b = findBooking(db, str(p.id));
+      if (!b) fail("예약을 찾을 수 없어요.");
+      var note = str(p.note, 300);
+      if (note === (b.ownerNote || "")) return { ok: true };
+      db.update("bookings", b.id, { ownerNote: note, handledBy: opt.adminName });
+      audit(opt, "📝 예약 메모 수정", [bLine(b), "메모: " + show(b.ownerNote) + " → " + show(note)]);
+      return { ok: true };
+    },
+    deleteBooking: function (p, db, opt) {
+      var b = findBooking(db, str(p.id));
+      if (!b) return { ok: true };
+      db.remove("bookings", b.id);
+      audit(opt, "🗑️ 예약 삭제", [bLine(b), "삭제 전 상태: " + (STATUS_LABELS[b.status] || b.status)]);
+      return { ok: true };
+    },
     saveMember: function (p, db, opt) {
       var w = who(p);
       var v = { name: w.name, last4: w.last4, phone: str(p.phone, 20), memo: str(p.memo, 300) };
       var dup = findMember(db, w.name, w.last4);
       if (p.id) {
         if (dup && dup.id !== p.id) fail("같은 이름·뒷자리 회원이 이미 있어요.");
+        var old = db.rows("members").filter(function (x) { return x.id === str(p.id); })[0] || {};
         db.update("members", str(p.id), v);
+        var ch = diff(old, v, [["name", "이름"], ["last4", "휴대폰 뒷자리"], ["phone", "연락처"], ["memo", "기타(메모)"]]);
+        if (ch.length) audit(opt, "✏️ 회원 정보 수정", [(old.name || v.name) + "(" + (old.last4 || v.last4) + ")"].concat(ch));
         return { id: str(p.id) };
       }
       if (dup) fail("같은 이름·뒷자리 회원이 이미 있어요.");
       v.id = newId(); v.createdAt = opt.now; db.insert("members", v);
+      var ml = [v.name + "(" + v.last4 + ")"];
+      if (v.phone) ml.push("연락처: " + v.phone);
+      if (v.memo) ml.push("기타(메모): " + v.memo);
+      audit(opt, "👤 회원 추가", ml);
       return { id: v.id };
     },
     // 회비 납부 기간 (한 회원에 여러 번 쌓여요)
@@ -171,19 +223,44 @@ var WoodshopCore = (function () {
       if (!isDate(s) || !isDate(e)) fail("회비기간 시작일과 종료일을 골라 주세요.");
       if (e < s) fail("종료일이 시작일보다 빨라요.");
       var v = { memberId: m.id, name: m.name, last4: m.last4, start: s, end: e, note: str(p.note, 100), by: opt.adminName || "" };
-      if (p.id) { db.update("fees", str(p.id), v); return { id: str(p.id) }; }
+      if (p.id) {
+        var oldF = db.rows("fees").filter(function (x) { return x.id === str(p.id); })[0] || {};
+        db.update("fees", str(p.id), v);
+        var fc = diff(oldF, v, [["start", "시작일"], ["end", "종료일"], ["note", "메모"]]);
+        if (fc.length) audit(opt, "💳 회비기간 수정", [m.name + "(" + m.last4 + ")"].concat(fc));
+        return { id: str(p.id) };
+      }
       v.id = newId(); v.createdAt = opt.now; db.insert("fees", v);
+      audit(opt, "💳 회비기간 추가", [m.name + "(" + m.last4 + ")", "기간: " + s + " ~ " + e + (v.note ? " · " + v.note : "")]);
       return { id: v.id };
     },
-    deleteFee: function (p, db) { db.remove("fees", str(p.id)); return { ok: true }; },
-    deleteMember: function (p, db) { db.remove("members", str(p.id)); return { ok: true }; },
-    saveConfig: function (p, db) {
+    deleteFee: function (p, db, opt) {
+      var f = db.rows("fees").filter(function (x) { return x.id === str(p.id); })[0];
+      if (!f) return { ok: true };
+      db.remove("fees", f.id);
+      audit(opt, "🗑️ 회비기간 삭제", [f.name + "(" + f.last4 + ")", "기간: " + f.start + " ~ " + f.end + (f.note ? " · " + f.note : "")]);
+      return { ok: true };
+    },
+    deleteMember: function (p, db, opt) {
+      var m = db.rows("members").filter(function (x) { return x.id === str(p.id); })[0];
+      if (!m) return { ok: true };
+      db.remove("members", m.id);
+      audit(opt, "🗑️ 회원 삭제", [m.name + "(" + m.last4 + ")" + (m.memo ? " · 메모: " + m.memo : ""), "예약·회비 기록은 시트에 남아 있어요."]);
+      return { ok: true };
+    },
+    saveConfig: function (p, db, opt) {
+      var before = config(db);
       var cap = Math.max(1, Math.min(50, Number(p.capacity) || DEFAULT_CONFIG.capacity));
       var tools = (Array.isArray(p.tools) ? p.tools : splitTools(p.tools)).map(function (t) { return str(t, 30); }).filter(Boolean);
       var open = isTime(p.open) ? p.open : DEFAULT_CONFIG.open, close = isTime(p.close) ? p.close : DEFAULT_CONFIG.close;
       if (toMin(close) <= toMin(open)) fail("마감 시간이 시작 시간보다 늦어야 해요.");
       db.setConfig({ capacity: cap, tools: tools.join(", "), open: open, close: close });
-      return config(db);
+      var after = config(db);
+      var cc = diff({ capacity: before.capacity, hours: before.open + "~" + before.close, tools: before.tools.join(", ") },
+        { capacity: after.capacity, hours: after.open + "~" + after.close, tools: after.tools.join(", ") },
+        [["capacity", "같은 시간 최대 인원"], ["hours", "운영 시간"], ["tools", "장비 목록"]]);
+      if (cc.length) audit(opt, "⚙️ 공방 설정 변경", cc);
+      return after;
     },
   };
 
@@ -204,6 +281,8 @@ var WoodshopCore = (function () {
           return { ok: false, error: "아이디 또는 비밀번호가 맞지 않아요.", badPin: true };
         if (a === "adminCheck") return { ok: true, data: { id: str(req.adminId), name: admin.name } };
         opt.adminName = admin.name;
+        opt.adminId = str(req.adminId);
+        opt.actor = admin.name + " 원장";
         return { ok: true, data: adminActions[a](req, db, opt) };
       }
       return { ok: false, error: "알 수 없는 요청이에요." };
@@ -367,6 +446,7 @@ function options_() {
   return {
     admins: admins_(),
     notify: slackNotify_,
+    audit: slackAudit_,
     log: function (m) { Logger.log(m); },
     today: Utilities.formatDate(now, "Asia/Seoul", "yyyy-MM-dd"),
     now: Utilities.formatDate(now, "Asia/Seoul", "yyyy-MM-dd HH:mm"),
@@ -404,23 +484,27 @@ function setup() {
       missing.map(function (u) { return "PW_" + u[0] + " (" + u[1] + ")"; }).join(", ")
     : "준비 완료! 원장 " + ADMIN_USERS_.length + "명의 비밀번호가 모두 설정되어 있어요.");
   var s = slackConf_();
-  Logger.log(s.token && s.channel
-    ? "Slack 연결 정보가 있어요. testSlack 을 실행해 시험 메시지를 보내 보세요."
-    : "Slack 은 아직 연결 전이에요. (SLACK_BOT_TOKEN, SLACK_CHANNEL_ID)");
+  Logger.log(!s.token ? "Slack 은 아직 연결 전이에요. (SLACK_BOT_TOKEN)"
+    : "Slack 봇 토큰이 있어요. 채널 " + (s.channel ? "켜짐" : "꺼짐") + ", 고명균 원장님 개인 알림 " + (s.dmUser ? "켜짐" : "꺼짐") +
+      ". testSlack 을 실행해 시험 메시지를 보내 보세요.");
 }
 
-/* ───────────── Slack 알림 (알림만, 승인 절차 없음) ─────────────
- * 스크립트 속성(프로젝트 설정 > 스크립트 속성)에 아래 두 값을 넣으면 켜져요. 비어 있으면 Slack 없이 그대로 동작해요.
- *   SLACK_BOT_TOKEN   xoxb- 로 시작하는 봇 토큰
- *   SLACK_CHANNEL_ID  알림을 받을 채널 ID (C 로 시작)
- * 새 예약이 들어오면 채널에 알림이 가고, 회원이 취소하면 그 알림 아래에 취소 소식이 붙어요.
+/* ───────────── Slack 알림 ─────────────
+ * 스크립트 속성(프로젝트 설정 > 스크립트 속성)에 값을 넣으면 켜져요. 비어 있는 것은 조용히 건너뛰어요.
+ *   SLACK_BOT_TOKEN       xoxb- 로 시작하는 봇 토큰 (필수)
+ *   SLACK_CHANNEL_ID      (선택) 채널 ID (C…) — 새 예약·취소를 두 원장님이 함께 보는 채널
+ *   SLACK_DM_USER         고명균 원장님의 Slack 멤버 ID (U…) — 모든 데이터 변동을 개인 메시지로 받음
+ *   SLACK_DM_SKIP_EMAIL   (선택) 고명균 원장님의 구글 이메일 — 본인이 시트를 직접 고친 것은 알리지 않음
+ * 고명균 원장님(kommy9)이 원장 메뉴에서 직접 바꾼 내용은 본인에게 알리지 않아요.
  */
+var DM_SKIP_ADMIN_ = "kommy9";
 var SITE_URL_ = "https://kommynine.github.io/woodshop-booking/";
 var DAYS_KO_ = ["일", "월", "화", "수", "목", "금", "토"];
 
 function slackConf_() {
   var p = PropertiesService.getScriptProperties();
-  return { token: p.getProperty("SLACK_BOT_TOKEN"), channel: p.getProperty("SLACK_CHANNEL_ID") };
+  return { token: p.getProperty("SLACK_BOT_TOKEN"), channel: p.getProperty("SLACK_CHANNEL_ID"),
+    dmUser: p.getProperty("SLACK_DM_USER"), skipEmail: String(p.getProperty("SLACK_DM_SKIP_EMAIL") || "").trim().toLowerCase() };
 }
 
 function slackApi_(method, body) {
@@ -466,7 +550,7 @@ function slackBlocks_(b) {
 /** core.js 가 예약이 생기거나 바뀔 때 불러요. */
 function slackNotify_(event, b, db) {
   var c = slackConf_();
-  if (!c.token || !c.channel) return; // Slack 설정 전이면 조용히 넘어감
+  if (!c.token || !c.channel) return; // 채널 설정 전이면 조용히 넘어감 (개인 메시지는 따로 감)
   var msg = slackBlocks_(b);
   var ref = String(b.slackRef || "").split("|"); // "채널|ts"
   if (ref.length === 2 && ref[1]) {
@@ -481,13 +565,92 @@ function slackNotify_(event, b, db) {
   db.update("bookings", b.id, { slackRef: j.channel + "|" + j.ts });
 }
 
-/** Apps Script 편집기에서 실행: Slack 연결이 되는지 시험 메시지를 보내요. */
+/* ───────────── 고명균 원장님 개인 메시지: 모든 데이터 변동 ───────────── */
+
+function dmSend_(title, lines, actor, at) {
+  var c = slackConf_();
+  if (!c.token || !c.dmUser) return;
+  var text = "*" + title + "*\n" + lines.map(function (l) { return "• " + esc_(l); }).join("\n") +
+    "\n_누가: " + esc_(actor) + (at ? "  ·  " + esc_(at) : "") + "_";
+  slackApi_("chat.postMessage", { channel: c.dmUser, text: text, unfurl_links: false });
+}
+
+/** core.js 가 데이터가 바뀔 때마다 불러요 (앱에서 바꾼 것). */
+function slackAudit_(entry) {
+  if (entry.actorAdminId === DM_SKIP_ADMIN_) return; // 고명균 원장님 본인이 바꾼 건 알리지 않음
+  dmSend_(entry.title, entry.lines, entry.actor, entry.at);
+}
+
+function nowKo_() { return Utilities.formatDate(new Date(), "Asia/Seoul", "yyyy-MM-dd HH:mm"); }
+function editorEmail_(e) {
+  try { return (e && e.user && e.user.getEmail && e.user.getEmail()) || ""; } catch (err) { return ""; }
+}
+
+/** 시트를 사람이 직접 고쳤을 때 (설치형 '수정 시' 트리거). 앱이 고친 것은 트리거가 울리지 않아요. */
+function sheetEditWatcher(e) {
+  if (!e || !e.range) return;
+  var email = editorEmail_(e), c = slackConf_();
+  if (email && c.skipEmail && email.toLowerCase() === c.skipEmail) return;
+  var sh = e.range.getSheet(), r = e.range.getRow(), col = e.range.getColumn();
+  var header = sh.getRange(1, 1, 1, Math.max(sh.getLastColumn(), 1)).getDisplayValues()[0];
+  var lines = [];
+  var multi = e.range.getNumRows() > 1 || e.range.getNumColumns() > 1;
+  var nameCol = header.indexOf("이름") + 1, rowName = "";
+  if (nameCol > 0 && r > 1) rowName = sh.getRange(r, nameCol).getDisplayValue();
+  if (r === 1) lines.push("⚠️ 첫 줄(제목 줄)이 바뀌었어요. 앱이 칸을 못 찾을 수 있으니 원래대로 돌려 주세요.");
+  if (multi) {
+    lines.push("'" + sh.getName() + "' 탭 " + e.range.getA1Notation() + " 여러 칸을 한꺼번에 고쳤어요." + (rowName ? " (" + rowName + " 줄 포함)" : ""));
+  } else {
+    var colName = header[col - 1] || (col + "번째 칸");
+    lines.push("'" + sh.getName() + "' 탭 " + r + "번째 줄" + (rowName ? " (" + rowName + ")" : "") + " · " + colName);
+    var oldV = e.oldValue == null ? "" : String(e.oldValue), newV = e.value == null ? e.range.getDisplayValue() : String(e.value);
+    lines.push(show_(oldV) + " → " + show_(newV));
+  }
+  dmSend_("✏️ 구글 시트 직접 수정", lines, email ? "시트 편집자 " + email : "시트 편집자 (계정 확인 불가)", nowKo_());
+}
+function show_(v) { return v ? "\"" + v + "\"" : "(비어 있음)"; }
+
+/** 줄·칸·탭을 넣거나 지웠을 때 (설치형 '변경 시' 트리거) */
+function sheetChangeWatcher(e) {
+  var kinds = { INSERT_ROW: "줄 추가", REMOVE_ROW: "줄 삭제", INSERT_COLUMN: "칸(열) 추가", REMOVE_COLUMN: "칸(열) 삭제",
+    INSERT_GRID: "탭 추가", REMOVE_GRID: "탭 삭제" };
+  if (!e || !kinds[e.changeType]) return;
+  var email = editorEmail_(e), c = slackConf_();
+  if (email && c.skipEmail && email.toLowerCase() === c.skipEmail) return;
+  var tab = "";
+  try { tab = e.source.getActiveSheet().getName(); } catch (err) {}
+  var lines = [(tab ? "'" + tab + "' 탭에서 " : "") + kinds[e.changeType] + "가 있었어요."];
+  if (e.changeType === "REMOVE_ROW") lines.push("지워진 내용은 시트의 '파일 → 버전 기록'에서 볼 수 있어요.");
+  if (e.changeType === "REMOVE_COLUMN" || e.changeType === "REMOVE_GRID") lines.push("⚠️ 앱이 쓰는 칸이나 탭이 지워졌다면 예약이 안 될 수 있어요.");
+  dmSend_("🧱 구글 시트 구조 변경", lines, email ? "시트 편집자 " + email : "시트 편집자 (계정 확인 불가)", nowKo_());
+}
+
+/** Apps Script 편집기에서 한 번 실행: 시트 직접 수정 알림(트리거 2개)을 켜요. 여러 번 실행해도 중복되지 않아요. */
+function installSheetAlerts() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    var f = t.getHandlerFunction();
+    if (f === "sheetEditWatcher" || f === "sheetChangeWatcher") ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger("sheetEditWatcher").forSpreadsheet(ss).onEdit().create();
+  ScriptApp.newTrigger("sheetChangeWatcher").forSpreadsheet(ss).onChange().create();
+  Logger.log("시트 직접 수정 알림을 켰어요. 이제 '" + ss.getName() + "' 시트를 고치면 고명균 원장님께 알림이 가요.");
+}
+
+/** Apps Script 편집기에서 실행: Slack 연결 시험 */
 function testSlack() {
-  var c = slackConf_(), miss = [];
-  if (!c.token) miss.push("SLACK_BOT_TOKEN");
-  if (!c.channel) miss.push("SLACK_CHANNEL_ID");
-  if (miss.length) { Logger.log("스크립트 속성이 비어 있어요: " + miss.join(", ")); return; }
-  slackApi_("chat.postMessage", { channel: c.channel,
-    text: "🪚 대전세종목공기술학원 예약 알림이 연결됐어요! 이제 새 방문 예약이 들어오면 이 채널로 알려 드릴게요." });
-  Logger.log("시험 메시지를 보냈어요. Slack 채널을 확인해 주세요.");
+  var c = slackConf_();
+  if (!c.token) { Logger.log("스크립트 속성 SLACK_BOT_TOKEN 이 비어 있어요."); return; }
+  var done = [];
+  if (c.dmUser) {
+    dmSend_("🪚 개인 알림 연결 완료", ["앞으로 예약·회원·회비·설정의 추가·수정·삭제와 시트 직접 수정을 여기로 알려 드릴게요.",
+      "고명균 원장님(kommy9)이 직접 바꾼 내용은 알리지 않아요."], "예약 서버", nowKo_());
+    done.push("고명균 원장님 개인 메시지");
+  }
+  if (c.channel) {
+    slackApi_("chat.postMessage", { channel: c.channel,
+      text: "🪚 대전세종목공기술학원 예약 알림이 연결됐어요! 새 방문 예약과 취소를 이 채널로 알려 드릴게요." });
+    done.push("채널");
+  }
+  Logger.log(done.length ? "시험 메시지를 보냈어요: " + done.join(", ") : "SLACK_DM_USER 와 SLACK_CHANNEL_ID 가 모두 비어 있어요.");
 }

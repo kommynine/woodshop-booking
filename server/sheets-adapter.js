@@ -150,6 +150,7 @@ function options_() {
   return {
     admins: admins_(),
     notify: slackNotify_,
+    audit: slackAudit_,
     log: function (m) { Logger.log(m); },
     today: Utilities.formatDate(now, "Asia/Seoul", "yyyy-MM-dd"),
     now: Utilities.formatDate(now, "Asia/Seoul", "yyyy-MM-dd HH:mm"),
@@ -187,7 +188,7 @@ function setup() {
       missing.map(function (u) { return "PW_" + u[0] + " (" + u[1] + ")"; }).join(", ")
     : "준비 완료! 원장 " + ADMIN_USERS_.length + "명의 비밀번호가 모두 설정되어 있어요.");
   var s = slackConf_();
-  Logger.log(s.token && s.channel
-    ? "Slack 연결 정보가 있어요. testSlack 을 실행해 시험 메시지를 보내 보세요."
-    : "Slack 은 아직 연결 전이에요. (SLACK_BOT_TOKEN, SLACK_CHANNEL_ID)");
+  Logger.log(!s.token ? "Slack 은 아직 연결 전이에요. (SLACK_BOT_TOKEN)"
+    : "Slack 봇 토큰이 있어요. 채널 " + (s.channel ? "켜짐" : "꺼짐") + ", 고명균 원장님 개인 알림 " + (s.dmUser ? "켜짐" : "꺼짐") +
+      ". testSlack 을 실행해 시험 메시지를 보내 보세요.");
 }
