@@ -14,7 +14,7 @@
 | `server/Code.gs` | 구글 시트에 붙여넣을 서버 코드 (`build.sh`로 자동 생성) |
 | `server/sheets-adapter.js` | `Code.gs`를 만드는 재료 중 구글 시트 연결 부분 |
 | `server/slack.js` | `Code.gs`를 만드는 재료 중 Slack 알림 부분 |
-| `SLACK-안내.md` | Slack 알림 연결 방법 (처음 하시는 분용) |
+| `SLACK-guide.md` | Slack 알림 연결 방법 (처음 하시는 분용) |
 
 `config.js`가 비어 있으면 **체험 모드**로 돌아가요. 이 기기에만 저장되고, 원장 메뉴는 아이디 `kommy9` 또는 `wood77`, 비밀번호 `1234`로 들어가요.
 
